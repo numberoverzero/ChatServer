@@ -9,6 +9,8 @@ using System.Net.Sockets;
 
 using Engine.DataStructures;
 using Engine.Networking;
+using Engine.Networking.Packets;
+
 using Engine.Utility;
 
 namespace ChatServer
@@ -48,7 +50,7 @@ namespace ChatServer
                 Authenticate(client);
                 var nick = nickTable[client];
                 log.Info("Server:Connect:AssociatedNick:Data:Nick:<{0}>".format(nick));
-                SendMsg("{0} has joined the chat.".Timestamped().format(nick));
+                SendPacket(MakePacket("{0} has joined the chat.".Timestamped().format(nick)));
             }
             catch { }
         }
@@ -63,7 +65,7 @@ namespace ChatServer
                 nick = nickTable[client];
                 nickTable.Remove(client);
                 log.Info("Server:Disconnect:DisassociatedNick:Data:Nick:<{0}>".format(nick));
-                SendMsg("{0} has left the chat.".Timestamped().format(nick));
+                SendPacket(MakePacket("{0} has left the chat.".Timestamped().format(nick)));
             }
             catch (KeyNotFoundException)
             {
@@ -86,16 +88,16 @@ namespace ChatServer
 
             while (true)
             {
-                WriteMsg("Please enter a nickname:", client);
+                WritePacket(MakePacket("Please enter a nickname:"), client);
                 while (!client.HasQueuedReadMessages) Thread.Sleep(1);
                 
-                nick = client.Read();
+                nick = (client.ReadPacket() as ChatPacket).Message;
                 if (IsNickAvailable(nick))
                 {
                     localSuccess = e.Success = true;
                     nickTable[client] = nick;
 
-                    WriteMsg("Successfully registered nickname: {0}".format(nick), client);
+                    WritePacket(MakePacket("Successfully registered nickname: {0}".format(nick)), client);
 
                     // Replace failed attempt message with success
                     e.Parameters.Remove(nickInUseKey);
@@ -103,7 +105,7 @@ namespace ChatServer
                 }
                 else
                 {
-                    WriteMsg("Sorry, that name is not available.", client);
+                    WritePacket(MakePacket("Sorry, that name is not available."), client);
                     e.Parameters[nickInUseKey] = nick;
                     log.Info(nickInUseKey + ":<{0}>".format(nick));
                 }
@@ -113,11 +115,21 @@ namespace ChatServer
             }
         }
 
-        public override void ReceiveMsg(string msg, Client client)
+        public override void ReceivePacket(Packet packet, Client client)
         {
             var nick = nickTable[client];
-            if(String.IsNullOrEmpty(msg)) return;
-            SendMsg("{0}: {1}".format(nick, msg));
+            var cPacket = packet as ChatPacket;
+            if(String.IsNullOrEmpty(cPacket.Message)) return;
+            SendPacket(MakePacket("{0}: {1}".format(nick, cPacket.Message)));
+        }
+
+        ChatPacket MakePacket(string msg)
+        {
+            var packet = new ChatPacket();
+            packet.Message = msg;
+            packet.From = "";
+            packet.To = "";
+            return packet;
         }
     }
 }
