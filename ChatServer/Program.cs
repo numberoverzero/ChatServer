@@ -1,134 +1,423 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Collections.Concurrent;
-using System.Linq;
-using System.Text;
-using System.Threading;
+using System.ComponentModel;
 using System.Net;
 using System.Net.Sockets;
-
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
 using Engine.DataStructures;
 using Engine.Networking;
 using Engine.Networking.Packets;
-
 using Engine.Utility;
 
-namespace ChatServer
+namespace ChatProgram
 {
-    class Program
+    internal class Program
     {
-        static void Main(string[] args)
+        private static void Main(string[] args)
         {
+            PacketGlobals.Initialize();
+
             if (args.Length < 1) return;
-            var portString = args[0];
-            string logfile = null;
-            if (args.Length > 1)
-                logfile = args[1];
-            int port = int.Parse(portString);
-            var server = new ChatServer(IPAddress.Any, port, logfile);
-            server.Start();
+            var mode = args[0];
+
+            switch (mode.ToLower())
+            {
+                case "client":
+                    ChatClientRunner.Run();
+                    break;
+                case "server":
+                    {
+                        var port = int.Parse(args[1]);
+                        var logfile = args.Length > 2 ? args[2] : null;
+
+                        ChatServerRunner.Run(port, logfile);
+                    }
+                    break;
+            }
         }
     }
 
     public class ChatServer : BasicServer
     {
-        BidirectionalDict<Client, string> nickTable;
+        private readonly BidirectionalDict<Client, string> nickTable;
 
         public ChatServer(IPAddress localaddr, int port, string logfile) : base(localaddr, port, logfile)
         {
             nickTable = new BidirectionalDict<Client, string>();
             OnDisconnect += Handle_OnDisconnect;
             OnConnect += DefaultHandle_OnConnect;
-            OnConnect += Authenticate_OnConnect;
-        }
-
-        protected void Authenticate_OnConnect(object sender, ServerEventArgs args)
-        {
-            var client = args.Client;
-            try
-            {
-                Authenticate(client);
-                var nick = nickTable[client];
-                log.Info("Server:Connect:AssociatedNick:Data:Nick:<{0}>".format(nick));
-                SendPacket(MakePacket("{0} has joined the chat.".Timestamped().format(nick)));
-            }
-            catch { }
         }
 
         protected void Handle_OnDisconnect(object sender, ServerEventArgs args)
         {
             var client = args.Client;
-            string ip = client.IPString;
+            var ip = client.GetIP;
             string nick = null;
             try
             {
                 nick = nickTable[client];
                 nickTable.Remove(client);
-                log.Info("Server:Disconnect:DisassociatedNick:Data:Nick:<{0}>".format(nick));
+                Log.Info("Server:Disconnect:DisassociatedNick:Data:Nick:<{0}>".format(nick));
                 SendPacket(MakePacket("{0} has left the chat.".Timestamped().format(nick)));
             }
             catch (KeyNotFoundException)
             {
-                log.Warn("Exception:ServerException:UnknownNickAssociation:Data:Key:<{0}>".format(ip));
-                log.Warn("Exception:ServerException:UnknownNickAssociation:Data:PossibleValue:<{0}>".format(nick));
-                log.Warn("Exception:ServerException:UnknownNickAssociation:Data:Note:User may not have authenticated with the server before disconnecting.".format(nick));
+                Log.Warn("Exception:ServerException:UnknownNickAssociation:Data:Key:<{0}>".format(ip));
+                Log.Warn("Exception:ServerException:UnknownNickAssociation:Data:PossibleValue:<{0}>".format(nick));
+                Log.Warn(
+                    "Exception:ServerException:UnknownNickAssociation:Data:Note:User may not have authenticated with the server before disconnecting."
+                        .format(nick));
             }
         }
 
-        bool IsNickAvailable(string nick) { return !(String.IsNullOrEmpty(nick) || nickTable.HasItem(nick)); }
-
-        public override void Authenticate(Client client, ServerEventArgs e = null)
+        private bool IsNickAvailable(string nick)
         {
-            string nick = null;
-            const string nickInUseKey = "Server:AuthFail:Reason:NickInUse:Data:Nick";
-            if (e == null) e = new ServerEventArgs(false, client);
-            
-            // Need a local success variable in case base Authentication changes e.Success from true
-            var localSuccess = false;
-
-            while (true)
-            {
-                WritePacket(MakePacket("Please enter a nickname:"), client);
-                while (!client.HasQueuedReadMessages) Thread.Sleep(1);
-                
-                nick = (client.ReadPacket() as ChatPacket).Message;
-                if (IsNickAvailable(nick))
-                {
-                    localSuccess = e.Success = true;
-                    nickTable[client] = nick;
-
-                    WritePacket(MakePacket("Successfully registered nickname: {0}".format(nick)), client);
-
-                    // Replace failed attempt message with success
-                    e.Parameters.Remove(nickInUseKey);
-                    e.Parameters["Server:AuthSucceed:Data:Nick"] = nick;
-                }
-                else
-                {
-                    WritePacket(MakePacket("Sorry, that name is not available."), client);
-                    e.Parameters[nickInUseKey] = nick;
-                    log.Info(nickInUseKey + ":<{0}>".format(nick));
-                }
-                
-                base.Authenticate(client, e);
-                if (localSuccess) break;
-            }
+            return !(String.IsNullOrEmpty(nick) || nickTable.Contains(nick));
         }
 
         public override void ReceivePacket(Packet packet, Client client)
         {
-            var nick = nickTable[client];
+            if (!IsAuthenticated(client))
+            {
+                var authPacket = packet as AuthPacket;
+                if (authPacket == null) return;
+
+                HandleAutheticatePacket(authPacket, client);
+                return;
+            }
+
             var cPacket = packet as ChatPacket;
-            if(String.IsNullOrEmpty(cPacket.Message)) return;
+            var nick = nickTable[client];
+
+            if (cPacket == null) return;
+            if (String.IsNullOrEmpty(cPacket.Message)) return;
+
             SendPacket(MakePacket("{0}: {1}".format(nick, cPacket.Message)));
         }
 
-        ChatPacket MakePacket(string msg)
+        private void HandleAutheticatePacket(AuthPacket packet, Client client)
         {
-            var packet = new ChatPacket();
-            packet.Message = msg;
-            packet.From = "";
-            packet.To = "";
+            const string nickInUseKey = "Server:AuthFail:Reason:NickInUse:Data:Nick:<{0}>";
+            var username = packet.UserName;
+            var args = new ServerEventArgs(false, client);
+            if (IsNickAvailable(username))
+            {
+                SendServerMessage("Sorry, the nickname '{0}' is already taken.".format(username));
+                SendServerMessage("Please select a different username:");
+                Log.Info(nickInUseKey.format(username));
+                SendPacket(new AuthRequestPacket(), client);
+            }
+            else
+            {
+                nickTable[client] = username;
+                SendServerMessage("Please welcome {0} to the server!".format(username));
+                args.Success = true;
+            }
+            Authenticate(client, args);
+        }
+
+        private void SendServerMessage(string msg, params Client[] clients)
+        {
+            SendPacket(MakePacket("Server: {0}".format(msg)), clients);
+        }
+
+        private static ChatPacket MakePacket(string msg)
+        {
+            return new ChatPacket {Message = msg};
+        }
+
+        protected override void DefaultHandle_OnConnect(object sender, ServerEventArgs args)
+        {
+            base.DefaultHandle_OnConnect(sender, args);
+            var client = args.Client;
+            SendServerMessage("Welcome to the server!  Please select a username:", client);
+            SendPacket(new AuthRequestPacket(), client);
+        }
+    }
+
+    public static class ChatClientRunner
+    {
+        public static void Run()
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            var client = new ChatClient();
+            Application.Run(client.Form);
+        }
+    }
+
+    public static class ChatServerRunner
+    {
+        public static void Run(int port, string logfile)
+        {
+            new ChatServer(IPAddress.Any, port, logfile).Start();
+        }
+    }
+
+    public class ChatClient
+    {
+        #region State enum
+
+        public enum State
+        {
+            PreConnection,
+            ConnectedWithoutAuthentication,
+            AwaitingAuthenticationResponse,
+            ConnectedWithAuthentication,
+            PostConnection
+        }
+
+        #endregion
+
+        private const string EnterIP = "Please enter the server's IP address and port.";
+        private const string ValidIP = "Now connected to {0}:{1}!";
+        private const string FailedIP = "Failed to connect to {0}:{1}.";
+        private const string InvalidIP = "Invalid format.  Format is (for example) 192.168.1.1:5000";
+        private const string TryingIP = "Trying to connect...";
+        public readonly TextBox ChatEnterTextBox;
+        public readonly TextBox ChatHistoryTextBox;
+        public Client Client;
+        public State ConnectionState;
+        public Form Form;
+
+        public ChatClient()
+        {
+            Form = new Form();
+            Title = "OFFLINE";
+
+            ChatHistoryTextBox = new TextBox {Dock = DockStyle.Fill, Multiline = true, ReadOnly = true};
+            ChatEnterTextBox = new TextBox {Dock = DockStyle.Bottom};
+
+            Form.Controls.Add(ChatEnterTextBox);
+            Form.Controls.Add(ChatHistoryTextBox);
+
+            Form.Show();
+            ChatEnterTextBox.Focus();
+            ChatEnterTextBox.KeyDown += OnKeyDown;
+
+            ConnectionState = State.PreConnection;
+
+            Form.Closing += HandleClientClose;
+            WriteToHistory(EnterIP);
+        }
+
+        private string Title
+        {
+            get { return Form.Text; }
+            set { Form.Text = value; }
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern void ExitProcess(int a);
+
+        private void OnKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Enter) return;
+            var msg = ChatEnterTextBox.Text;
+            switch (ConnectionState)
+            {
+                case State.PreConnection:
+                    TryConnect(msg);
+                    break;
+                case State.ConnectedWithoutAuthentication:
+                    Client.WritePacket(new AuthPacket {UserName = msg});
+                    break;
+                case State.AwaitingAuthenticationResponse:
+                    // Don't send the message or clear the text box - we haven't gotten a response from the server regarding user name.
+                    return;
+                case State.ConnectedWithAuthentication:
+                    Client.WritePacket(new ChatPacket {Message = msg});
+                    break;
+                case State.PostConnection:
+                    const string err = "No connection to server.  The following message was not sent: <{0}>";
+                    WriteToHistory(err.format(msg));
+                    break;
+            }
+            ChatEnterTextBox.Text = "";
+        }
+
+        private void TryConnect(string msg)
+        {
+            var tcpClient = new TcpClient();
+            WriteToHistory(TryingIP);
+            var parts = msg.Split(':');
+            if (parts.Length == 2)
+            {
+                var host = parts[0];
+                var port = int.Parse(parts[1]);
+                try
+                {
+                    tcpClient.Connect(host, port);
+                    Client = new Client(tcpClient);
+                    Client.OnReadPacket += OnClientRead;
+                    WriteToHistory(ValidIP.format(host, port));
+                    ConnectionState = State.ConnectedWithoutAuthentication;
+                    Title = "CONNECTED: <{0}:{1}>".format(host, port);
+                    return;
+                }
+                catch
+                {
+                    WriteToHistory(FailedIP.format(host, port));
+                }
+            }
+            else
+            {
+                WriteToHistory(InvalidIP);
+            }
+            // Failed connection, so prompt to try again
+            WriteToHistory(EnterIP);
+        }
+
+        private void WriteToHistory(string msg, bool newline = true)
+        {
+            if (msg == null) return;
+            if (newline) msg = msg + "\r\n";
+            ChatHistoryTextBox.InvokeEx(c => c.AppendText(msg));
+        }
+
+        /// <summary>
+        ///   Called when the client receives a new packet
+        /// </summary>
+        /// <param name="sender"> </param>
+        /// <param name="args"> </param>
+        protected void OnClientRead(object sender, EventArgs args)
+        {
+            var client = sender as Client;
+            if (client == null) return;
+
+            var packet = client.ReadPacket();
+            if (packet == null) return;
+
+            var authResponsePacket = packet as AuthResponsePacket;
+            if (authResponsePacket != null)
+            {
+                ConnectionState = authResponsePacket.Success
+                                      ? State.ConnectedWithAuthentication
+                                      : State.ConnectedWithoutAuthentication;
+                return;
+            }
+
+
+            var chatPacket = packet as ChatPacket;
+            if (chatPacket == null) return;
+            WriteToHistory(chatPacket.Message);
+        }
+
+        private void HandleClientClose(object sender, CancelEventArgs e)
+        {
+            try
+            {
+                Client.Close();
+            }
+            catch
+            {
+            }
+            e.Cancel = false;
+            Application.Exit();
+            ExitProcess(0);
+        }
+    }
+
+    public class ChatPacket : Packet
+    {
+        public string Message;
+
+        public override void BuildAsByteArray(ByteArrayBuilder builder)
+        {
+            base.BuildAsByteArray(builder);
+            builder.Add(Message);
+        }
+
+        protected override int ReadFromByteArray(ByteArrayReader reader)
+        {
+            base.ReadFromByteArray(reader);
+            Message = reader.ReadString();
+            return reader.Index;
+        }
+    }
+
+    public class AuthPacket : Packet
+    {
+        public string UserName;
+
+        public override void BuildAsByteArray(ByteArrayBuilder builder)
+        {
+            base.BuildAsByteArray(builder);
+            builder.Add(UserName);
+        }
+
+        protected override int ReadFromByteArray(ByteArrayReader reader)
+        {
+            base.ReadFromByteArray(reader);
+            UserName = reader.ReadString();
+            return reader.Index;
+        }
+    }
+
+    public class AuthRequestPacket : Packet
+    {
+    }
+
+    public class AuthResponsePacket : Packet
+    {
+        public bool Success;
+
+        public override void BuildAsByteArray(ByteArrayBuilder builder)
+        {
+            base.BuildAsByteArray(builder);
+            builder.Add(Success);
+        }
+
+        protected override int ReadFromByteArray(ByteArrayReader reader)
+        {
+            base.ReadFromByteArray(reader);
+            Success = reader.ReadBool();
+            return reader.Index;
+        }
+    }
+
+    public static class PacketGlobals
+    {
+        private static readonly BidirectionalDict<string, int> Mapping = new BidirectionalDict<string, int>();
+
+        private static int _nextType;
+
+        public static void Initialize()
+        {
+            Packet.GetTypeFunction = TypeFunc;
+            Packet.GetNameFunction = NameFunc;
+            Packet.BuildPacketFunction = ToPacket;
+            AddPacket("ChatPacket");
+            AddPacket("AuthPacket");
+            AddPacket("AuthRequestPacket");
+        }
+
+        private static void AddPacket(string packetName)
+        {
+            Mapping.Add(_nextType, packetName);
+            _nextType++;
+        }
+
+        public static int TypeFunc(string packetName)
+        {
+            return Mapping[packetName];
+        }
+
+        public static string NameFunc(int type)
+        {
+            return Mapping[type];
+        }
+
+        public static Packet ToPacket(byte[] bytes)
+        {
+            var reader = new ByteArrayReader(bytes, 0);
+            var typeInt = reader.ReadInt32();
+            var name = Packet.GetNameFunction(typeInt);
+            var type = Type.GetType(name);
+            if (type == null) return Packet.EmptyPacket;
+            var packet = (Packet) Activator.CreateInstance(type);
+            packet.FromByteArray(bytes, 0);
             return packet;
         }
     }
