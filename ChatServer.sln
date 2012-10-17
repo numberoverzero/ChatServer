@@ -1,7 +1,7 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 11.00
 # Visual Studio 2010
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ChatServer", "ChatServer\ChatServer.csproj", "{3F14C54A-F305-4A28-B23E-A5B934B106C7}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ChatProgram", "ChatServer\ChatProgram.csproj", "{3F14C54A-F305-4A28-B23E-A5B934B106C7}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

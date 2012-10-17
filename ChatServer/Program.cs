@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
 using Engine.DataStructures;
 using Engine.Networking;
@@ -38,104 +39,6 @@ namespace ChatProgram
         }
     }
 
-    public class ChatServer : BasicServer
-    {
-        private readonly BidirectionalDict<Client, string> nickTable;
-
-        public ChatServer(IPAddress localaddr, int port, string logfile) : base(localaddr, port, logfile)
-        {
-            nickTable = new BidirectionalDict<Client, string>();
-            OnDisconnect += Handle_OnDisconnect;
-            OnConnect += DefaultHandle_OnConnect;
-        }
-
-        protected void Handle_OnDisconnect(object sender, ServerEventArgs args)
-        {
-            var client = args.Client;
-            var ip = client.GetIP;
-            string nick = null;
-            try
-            {
-                nick = nickTable[client];
-                nickTable.Remove(client);
-                Log.Info("Server:Disconnect:DisassociatedNick:Data:Nick:<{0}>".format(nick));
-                SendPacket(MakePacket("{0} has left the chat.".Timestamped().format(nick)));
-            }
-            catch (KeyNotFoundException)
-            {
-                Log.Warn("Exception:ServerException:UnknownNickAssociation:Data:Key:<{0}>".format(ip));
-                Log.Warn("Exception:ServerException:UnknownNickAssociation:Data:PossibleValue:<{0}>".format(nick));
-                Log.Warn(
-                    "Exception:ServerException:UnknownNickAssociation:Data:Note:User may not have authenticated with the server before disconnecting."
-                        .format(nick));
-            }
-        }
-
-        private bool IsNickAvailable(string nick)
-        {
-            return !(String.IsNullOrEmpty(nick) || nickTable.Contains(nick));
-        }
-
-        public override void ReceivePacket(Packet packet, Client client)
-        {
-            if (!IsAuthenticated(client))
-            {
-                var authPacket = packet as AuthPacket;
-                if (authPacket == null) return;
-
-                HandleAutheticatePacket(authPacket, client);
-                return;
-            }
-
-            var cPacket = packet as ChatPacket;
-            var nick = nickTable[client];
-
-            if (cPacket == null) return;
-            if (String.IsNullOrEmpty(cPacket.Message)) return;
-
-            SendPacket(MakePacket("{0}: {1}".format(nick, cPacket.Message)));
-        }
-
-        private void HandleAutheticatePacket(AuthPacket packet, Client client)
-        {
-            const string nickInUseKey = "Server:AuthFail:Reason:NickInUse:Data:Nick:<{0}>";
-            var username = packet.UserName;
-            var args = new ServerEventArgs(false, client);
-            if (IsNickAvailable(username))
-            {
-                SendServerMessage("Sorry, the nickname '{0}' is already taken.".format(username));
-                SendServerMessage("Please select a different username:");
-                Log.Info(nickInUseKey.format(username));
-                SendPacket(new AuthRequestPacket(), client);
-            }
-            else
-            {
-                nickTable[client] = username;
-                SendServerMessage("Please welcome {0} to the server!".format(username));
-                args.Success = true;
-            }
-            Authenticate(client, args);
-        }
-
-        private void SendServerMessage(string msg, params Client[] clients)
-        {
-            SendPacket(MakePacket("Server: {0}".format(msg)), clients);
-        }
-
-        private static ChatPacket MakePacket(string msg)
-        {
-            return new ChatPacket {Message = msg};
-        }
-
-        protected override void DefaultHandle_OnConnect(object sender, ServerEventArgs args)
-        {
-            base.DefaultHandle_OnConnect(sender, args);
-            var client = args.Client;
-            SendServerMessage("Welcome to the server!  Please select a username:", client);
-            SendPacket(new AuthRequestPacket(), client);
-        }
-    }
-
     public static class ChatClientRunner
     {
         public static void Run()
@@ -157,8 +60,6 @@ namespace ChatProgram
 
     public class ChatClient
     {
-        #region State enum
-
         public enum State
         {
             PreConnection,
@@ -167,8 +68,6 @@ namespace ChatProgram
             ConnectedWithAuthentication,
             PostConnection
         }
-
-        #endregion
 
         private const string EnterIP = "Please enter the server's IP address and port.";
         private const string ValidIP = "Now connected to {0}:{1}!";
@@ -180,6 +79,10 @@ namespace ChatProgram
         public Client Client;
         public State ConnectionState;
         public Form Form;
+
+        private string host;
+        private int port;
+        private string nick;
 
         public ChatClient()
         {
@@ -221,7 +124,8 @@ namespace ChatProgram
                     TryConnect(msg);
                     break;
                 case State.ConnectedWithoutAuthentication:
-                    Client.WritePacket(new AuthPacket {UserName = msg});
+                    Client.WritePacket(new AuthRequestPacket {UserName = msg});
+                    ConnectionState = State.AwaitingAuthenticationResponse;
                     break;
                 case State.AwaitingAuthenticationResponse:
                     // Don't send the message or clear the text box - we haven't gotten a response from the server regarding user name.
@@ -244,8 +148,8 @@ namespace ChatProgram
             var parts = msg.Split(':');
             if (parts.Length == 2)
             {
-                var host = parts[0];
-                var port = int.Parse(parts[1]);
+                host = parts[0];
+                port = int.Parse(parts[1]);
                 try
                 {
                     tcpClient.Connect(host, port);
@@ -281,23 +185,32 @@ namespace ChatProgram
         /// </summary>
         /// <param name="sender"> </param>
         /// <param name="args"> </param>
-        protected void OnClientRead(object sender, EventArgs args)
+        protected void OnClientRead(object sender, PacketArgs args)
         {
             var client = sender as Client;
             if (client == null) return;
 
-            var packet = client.ReadPacket();
+            var packet = args.Packet;
             if (packet == null) return;
 
             var authResponsePacket = packet as AuthResponsePacket;
-            if (authResponsePacket != null)
+            if (authResponsePacket != null && ConnectionState == State.AwaitingAuthenticationResponse)
             {
-                ConnectionState = authResponsePacket.Success
-                                      ? State.ConnectedWithAuthentication
-                                      : State.ConnectedWithoutAuthentication;
+                var authMsg = authResponsePacket.Message;
+                if (!authResponsePacket.Success)
+                {
+                    if (authMsg.StartsWith("NickInUse:"))
+                    {
+                        var badNick = authMsg.Split(new char[] {':'}, 2)[1];
+                        WriteToHistory("Sorry, the nickname '{0}' is already taken.".format(badNick));
+                    }
+                    WriteToHistory("Please select a different username:");
+                    return;
+                }
+                "CONNECTED as <{0}>: <{1}:{2}>".format(authMsg, host, port);
+                ConnectionState = State.ConnectedWithAuthentication;
                 return;
             }
-
 
             var chatPacket = packet as ChatPacket;
             if (chatPacket == null) return;
@@ -319,6 +232,103 @@ namespace ChatProgram
         }
     }
 
+    public class ChatServer : BasicServer
+    {
+        private readonly BidirectionalDict<Client, string> nickTable;
+
+        public ChatServer(IPAddress localaddr, int port, string logfile)
+            : base(localaddr, port, logfile)
+        {
+            nickTable = new BidirectionalDict<Client, string>();
+            OnDisconnect += Handle_OnDisconnect;
+            OnConnect += DefaultHandle_OnConnect;
+        }
+
+        protected void Handle_OnDisconnect(object sender, ServerEventArgs args)
+        {
+            var client = args.Client;
+            var ip = client.GetIP;
+            string nick = null;
+            try
+            {
+                nick = nickTable[client];
+                nickTable.Remove(client);
+                Log.Info("Server:Disconnect:DisassociatedNick:Data:Nick:<{0}>".format(nick));
+                SendPacket(MakePacket("{0} has left the chat.".Timestamped().format(nick)));
+            }
+            catch (KeyNotFoundException)
+            {
+                Log.Warn("Exception:ServerException:UnknownNickAssociation:Data:Key:<{0}>".format(ip));
+                Log.Warn("Exception:ServerException:UnknownNickAssociation:Data:PossibleValue:<{0}>".format(nick));
+                Log.Warn(
+                    "Exception:ServerException:UnknownNickAssociation:Data:Note:User may not have authenticated with the server before disconnecting."
+                        .format(nick));
+            }
+        }
+
+        private bool IsNickAvailable(string nick)
+        {
+            return !(String.IsNullOrEmpty(nick) || nickTable.Contains(nick));
+        }
+
+        public override void ReceivePacket(Packet packet, Client client)
+        {
+            if (!IsAuthenticated(client))
+            {
+                var authPacket = packet as AuthRequestPacket;
+                if (authPacket == null) return;
+
+                HandleAutheticatePacket(authPacket, client);
+                return;
+            }
+
+            var chatPacket = packet as ChatPacket;
+            var nick = nickTable[client];
+
+            if (chatPacket == null) return;
+            if (String.IsNullOrEmpty(chatPacket.Message)) return;
+
+            SendPacket(MakePacket("{0}: {1}".format(nick, chatPacket.Message)));
+        }
+
+        private void HandleAutheticatePacket(AuthRequestPacket requestPacket, Client client)
+        {
+            const string nickInUseKey = "Server:AuthFail:Reason:NickInUse:Data:Nick:<{0}>";
+            var username = requestPacket.UserName;
+            var args = new ServerEventArgs(false, client);
+            if (!IsNickAvailable(username))
+            {
+                Log.Info(nickInUseKey.format(username));
+                SendPacket(new AuthResponsePacket() { Success = false, Message = "NickInUse:{0}".format(username) }, client);
+            }
+            else
+            {
+                nickTable[client] = username;
+                SendPacket(new AuthResponsePacket() { Success = true, Message = username }, client);
+                SendServerMessage("Please welcome {0} to the server!".format(username));
+                args.Success = true;
+            }
+            Authenticate(client, args);
+        }
+
+        private void SendServerMessage(string msg, params Client[] clients)
+        {
+            SendPacket(MakePacket("Server: {0}".format(msg)), clients);
+        }
+
+        private static ChatPacket MakePacket(string msg)
+        {
+            return new ChatPacket { Message = msg };
+        }
+
+        protected override void DefaultHandle_OnConnect(object sender, ServerEventArgs args)
+        {
+            base.DefaultHandle_OnConnect(sender, args);
+            var client = args.Client;
+            SendServerMessage("Welcome to the server!  Please select a username:", client);
+        }
+    }
+
     public class ChatPacket : Packet
     {
         public string Message;
@@ -337,7 +347,7 @@ namespace ChatProgram
         }
     }
 
-    public class AuthPacket : Packet
+    public class AuthRequestPacket : Packet
     {
         public string UserName;
 
@@ -355,24 +365,23 @@ namespace ChatProgram
         }
     }
 
-    public class AuthRequestPacket : Packet
-    {
-    }
-
     public class AuthResponsePacket : Packet
     {
         public bool Success;
+        public string Message;
 
         public override void BuildAsByteArray(ByteArrayBuilder builder)
         {
             base.BuildAsByteArray(builder);
             builder.Add(Success);
+            builder.Add(Message);
         }
 
         protected override int ReadFromByteArray(ByteArrayReader reader)
         {
             base.ReadFromByteArray(reader);
             Success = reader.ReadBool();
+            Message = reader.ReadString();
             return reader.Index;
         }
     }
@@ -380,17 +389,18 @@ namespace ChatProgram
     public static class PacketGlobals
     {
         private static readonly BidirectionalDict<string, int> Mapping = new BidirectionalDict<string, int>();
-
+        private static string _namespace;
         private static int _nextType;
 
         public static void Initialize()
         {
+            _namespace = "ChatProgram";
             Packet.GetTypeFunction = TypeFunc;
             Packet.GetNameFunction = NameFunc;
             Packet.BuildPacketFunction = ToPacket;
             AddPacket("ChatPacket");
-            AddPacket("AuthPacket");
             AddPacket("AuthRequestPacket");
+            AddPacket("AuthResponsePacket");
         }
 
         private static void AddPacket(string packetName)
@@ -413,7 +423,7 @@ namespace ChatProgram
         {
             var reader = new ByteArrayReader(bytes, 0);
             var typeInt = reader.ReadInt32();
-            var name = Packet.GetNameFunction(typeInt);
+            var name = "{0}.{1}".format(_namespace, Packet.GetNameFunction(typeInt));
             var type = Type.GetType(name);
             if (type == null) return Packet.EmptyPacket;
             var packet = (Packet) Activator.CreateInstance(type);
