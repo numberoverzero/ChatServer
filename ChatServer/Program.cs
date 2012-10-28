@@ -333,6 +333,11 @@ namespace ChatProgram
     {
         public string Message;
 
+        public override Packet Copy()
+        {
+            return new ChatPacket();
+        }
+
         public override void BuildAsByteArray(ByteArrayBuilder builder)
         {
             base.BuildAsByteArray(builder);
@@ -350,6 +355,11 @@ namespace ChatProgram
     public class AuthRequestPacket : Packet
     {
         public string UserName;
+
+        public override Packet Copy()
+        {
+            return new AuthRequestPacket();
+        }
 
         public override void BuildAsByteArray(ByteArrayBuilder builder)
         {
@@ -370,6 +380,11 @@ namespace ChatProgram
         public bool Success;
         public string Message;
 
+        public override Packet Copy()
+        {
+            return new AuthResponsePacket();
+        }
+
         public override void BuildAsByteArray(ByteArrayBuilder builder)
         {
             base.BuildAsByteArray(builder);
@@ -388,47 +403,14 @@ namespace ChatProgram
 
     public static class PacketGlobals
     {
-        private static readonly BidirectionalDict<string, int> Mapping = new BidirectionalDict<string, int>();
-        private static string _namespace;
-        private static int _nextType;
-
         public static void Initialize()
         {
-            _namespace = "ChatProgram";
-            Packet.GetTypeFunction = TypeFunc;
-            Packet.GetNameFunction = NameFunc;
-            Packet.BuildPacketFunction = ToPacket;
-            AddPacket("ChatPacket");
-            AddPacket("AuthRequestPacket");
-            AddPacket("AuthResponsePacket");
-        }
-
-        private static void AddPacket(string packetName)
-        {
-            Mapping.Add(_nextType, packetName);
-            _nextType++;
-        }
-
-        public static int TypeFunc(string packetName)
-        {
-            return Mapping[packetName];
-        }
-
-        public static string NameFunc(int type)
-        {
-            return Mapping[type];
-        }
-
-        public static Packet ToPacket(byte[] bytes)
-        {
-            var reader = new ByteArrayReader(bytes, 0);
-            var typeInt = reader.ReadInt32();
-            var name = "{0}.{1}".format(_namespace, Packet.GetNameFunction(typeInt));
-            var type = Type.GetType(name);
-            if (type == null) return Packet.EmptyPacket;
-            var packet = (Packet) Activator.CreateInstance(type);
-            packet.FromByteArray(bytes, 0);
-            return packet;
+            var builder = new PacketBuilder();
+            builder.RegisterPackets(
+                new ChatPacket(),
+                new AuthRequestPacket(),
+                new AuthResponsePacket());
+            Packet.Builder = builder;
         }
     }
 }
